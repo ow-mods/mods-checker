@@ -141,6 +141,8 @@ async fn check_mod(
     let working_dir = TempDir::new().unwrap();
     let path = working_dir.path();
     let config = Config {
+        send_analytics: false,
+        last_viewed_db_alert: None,
         owml_path: path.to_str().unwrap().to_string(),
         database_url: DEFAULT_DB_URL.to_string(),
         alert_url: DEFAULT_ALERT_URL.to_string(),
