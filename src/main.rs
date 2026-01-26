@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::Parser;
 use cli::CheckerSubcommand;
-use octocrab::{models::repos::Release, repos::RepoHandler, Octocrab};
+use octocrab::{Octocrab, models::repos::Release, repos::RepoHandler};
 use owmods_core::{
     config::Config,
     constants::{DEFAULT_ALERT_URL, DEFAULT_DB_URL},
@@ -10,12 +10,16 @@ use owmods_core::{
     download::{install_mod_from_url, install_mod_from_zip},
     mods::local::{LocalMod, ModManifest},
 };
+use rustls::crypto::aws_lc_rs;
 use serde_derive::Serialize;
 use tempfile::TempDir;
 use thiserror::Error;
 use versions::Versioning;
 
 mod cli;
+mod licenses;
+
+use licenses::VALID_SPDX_LICENSES;
 
 #[derive(Error, Debug, Serialize)]
 pub enum CheckerError {
@@ -27,19 +31,31 @@ pub enum CheckerError {
     MissingRepo,
     #[error("This mod appears to be missing a release, did you forget to publish it?")]
     MissingRelease,
-    #[error("This mod has a release, but it's missing the mod asset, make sure you've uploaded a ZIP file")]
+    #[error(
+        "This mod has a release, but it's missing the mod asset, make sure you've uploaded a ZIP file"
+    )]
     MissingModAsset,
+    #[error(
+        "This mod is not using an open source license. Please license it. (See [Choose a license](https://choosealicense.com/) for details). Current License: {0}"
+    )]
+    MissingLicense(String),
     #[error("This mod failed to install when testing it: {0}")]
     FailedToInstall(String),
     #[error(
         "The unique name of this mod is not what was expected, expected {expected} (from the unique name you gave), got {actual} (from the mod's manifest.json)"
     )]
     UnexpectedUniqueName { expected: String, actual: String },
-    #[error("The version of this mod's manifest does not match the tag of the release, expected {expected} (from the release tag), got {actual} (from the mod's manifest.json). This can cause your mod to always be marked as out of date on the mod manager.")]
+    #[error(
+        "The version of this mod's manifest does not match the tag of the release, expected {expected} (from the release tag), got {actual} (from the mod's manifest.json). This can cause your mod to always be marked as out of date on the mod manager."
+    )]
     UnexpectedVersion { expected: String, actual: String },
-    #[error("This mod's manifest doesn't define a DLL file. Double check you specified `fileName` in manifest.json")]
+    #[error(
+        "This mod's manifest doesn't define a DLL file. Double check you specified `fileName` in manifest.json"
+    )]
     MissingDLL,
-    #[error("This mod's manifest defines a DLL file that doesn't exist: {0}. Double check the name your specified in manifest.json")]
+    #[error(
+        "This mod's manifest defines a DLL file that doesn't exist: {0}. Double check the name your specified in manifest.json"
+    )]
     InvalidDLL(String),
     #[error("This mod depends on another mod that seemingly doesn't exist: {0}")]
     MissingDependency(String),
@@ -47,11 +63,17 @@ pub enum CheckerError {
 
 #[derive(Error, Debug, Serialize)]
 pub enum CheckerWarning {
-    #[error("This mod's repo doesn't have a description, the description is used on the manager and website to describe your mod. You can add one by clicking the pencil icon on the right sidebar on your repo's main page")]
+    #[error(
+        "This mod's repo doesn't have a description, the description is used on the manager and website to describe your mod. You can add one by clicking the pencil icon on the right sidebar on your repo's main page"
+    )]
     MissingDescription,
-    #[error("This mod's repo doesn't have a README, the README is used on the website to describe your mod. You can add one by creating a file called `README.md` at the root of your repo")]
+    #[error(
+        "This mod's repo doesn't have a README, the README is used on the website to describe your mod. You can add one by creating a file called `README.md` at the root of your repo"
+    )]
     MissingReadme,
-    #[error("The git tag ({0}) of this mod's release is not parsable semver, this can cause your mod to always be marked as out of date on the mod manager")]
+    #[error(
+        "The git tag ({0}) of this mod's release is not parsable semver, this can cause your mod to always be marked as out of date on the mod manager"
+    )]
     InvalidSemverTag(String),
 }
 
@@ -106,13 +128,13 @@ fn check_dependencies(local_mod: &ModManifest, remote_db: &RemoteDatabase) -> Re
     Ok(())
 }
 
-async fn check_for_description_and_readme(
+async fn check_for_meta(
     octo: &Octocrab,
     owner: &str,
     repo_name: &str,
     repo: &RepoHandler<'_>,
     warnings: &mut Vec<CheckerWarning>,
-) {
+) -> Result {
     eprintln!("Checking For Description...");
     let m_repo: octocrab::models::Repository = octo
         .get(format!("/repos/{owner}/{repo_name}"), None::<&()>)
@@ -129,6 +151,22 @@ async fn check_for_description_and_readme(
     eprintln!("Checking For Readme...");
     if repo.get_readme().send().await.is_err() {
         warnings.push(CheckerWarning::MissingReadme);
+    }
+    eprintln!("Checking For License...");
+    let license = repo
+        .license()
+        .await
+        .ok()
+        .and_then(|resp| resp.license.map(|l| l.spdx_id));
+    if license
+        .as_ref()
+        .is_some_and(|l| VALID_SPDX_LICENSES.contains(&l.as_str().trim()))
+    {
+        Ok(())
+    } else {
+        Err(CheckerError::MissingLicense(
+            license.unwrap_or_else(|| "No License".to_string()),
+        ))
     }
 }
 
@@ -221,7 +259,7 @@ async fn install_mod(
                 .ok_or(CheckerError::MissingModAsset)?;
             let download_url = asset.browser_download_url.to_string();
 
-            check_for_description_and_readme(&octo, owner, repo_name, &repo, warnings).await;
+            check_for_meta(&octo, owner, repo_name, &repo, warnings).await?;
 
             eprintln!("Installing Mod...");
 
@@ -281,7 +319,9 @@ impl RawResult {
         if self.error.is_none() {
             out.push_str("> ✔ Success! This mod passed all checks!\n\n");
             let link = format!("owmods://install-url/{}", self.url.as_ref().unwrap());
-            let text = format!("You can test installing your mod by pasting the link below into your URL bar, the mod manager should open and install it.\n\n```txt\n{link}\n```\n\n");
+            let text = format!(
+                "You can test installing your mod by pasting the link below into your URL bar, the mod manager should open and install it.\n\n```txt\n{link}\n```\n\n"
+            );
             out.push_str(&text);
             out.push_str("Now that all checks have passed, please wait until a database admin approves your mod.\n\n");
         } else if self.error.is_some() {
@@ -289,13 +329,21 @@ impl RawResult {
             out.push_str("If you need help or believe this is a mistake, please [join the Discord](https://discord.gg/wusTQYbYTc).\n\n");
         }
 
-        format!("## Mod Checker Report\n\nThis is an automated system to check your mod for common issues, please see the results below.\n\n{}{}\n", issues, out.trim_end())
+        format!(
+            "## Mod Checker Report\n\nThis is an automated system to check your mod for common issues, please see the results below.\n\n{}{}\n",
+            issues,
+            out.trim_end()
+        )
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), CheckerError> {
     let cli = cli::CheckerCli::parse();
+
+    aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to set up TLS");
 
     let expected_unique_name = cli.expected_unique_name.as_deref();
 
