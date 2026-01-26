@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, sync::Arc};
 
 use clap::Parser;
 use cli::CheckerSubcommand;
@@ -27,8 +27,10 @@ pub enum CheckerError {
         "This unique name appears to be in use by another mod ({0}), please choose a different one"
     )]
     UniqueNameInUse(String),
-    #[error("This mod's repo doesn't appear to exist, please double check the URL you specified")]
-    MissingRepo,
+    #[error(
+        "This mod's repo doesn't appear to exist, please double check the URL you specified (GitHub gave status {0})"
+    )]
+    MissingRepo(u16),
     #[error("This mod appears to be missing a release, did you forget to publish it?")]
     MissingRelease,
     #[error(
@@ -237,11 +239,22 @@ async fn install_mod(
             eprintln!("Fetching Repo...");
 
             let octo = octocrab::instance();
+            let octo = if let Some(key) = std::env::var("CHECKER_GH_KEY").ok() {
+                Arc::new(octo.user_access_token(key).expect("Failed to auth"))
+            } else {
+                octo
+            };
             let (owner, repo_name) = repo.split_once('/').ok_or(CheckerError::MissingRelease)?;
             let repo = octo.repos(owner, repo_name);
 
-            if repo.get().await.is_err() {
-                return Err(CheckerError::MissingRepo);
+            match repo.get().await {
+                Ok(_) => {}
+                Err(octocrab::Error::GitHub { source: e, .. }) => {
+                    return Err(CheckerError::MissingRepo(e.status_code.as_u16()));
+                }
+                Err(e) => {
+                    panic!("Failed to fetch repo: {e:?}")
+                }
             }
 
             let release = get_latest_release(&repo).await?;
